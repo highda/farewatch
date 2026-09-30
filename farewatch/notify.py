@@ -3,9 +3,9 @@ Nextcloud's admin_notifications API.
 
 - Each trip (route + dates, any source) is announced once, and again only if it gets `redrop_pct` cheaper
   than when it was last announced, or turns urgent.
-- `daily_digest`: learning (default) = one status message per day during the learning phase, even with no deals;
-  always = a digest at the morning and the afternoon run (one per half of the day); never = deals only.
-  In learning mode several runs a day still send at most one digest.
+- `daily_digest`: learning (default) = one status message per morning/afternoon run during the learning phase, even with no deals;
+  always = every day; never = deals only. A digest goes out at most once per half of the day (the 08:00 and the
+  16:00 run each get one; extra manual runs stay silent).
 - Marking happens when the notification is built (at-most-once): a failed Nextcloud call is not retried.
 """
 from __future__ import annotations
@@ -50,8 +50,7 @@ def build(cfg: Config, a: Analysis, conn, mark: bool = True) -> dict:
     fresh = new_outliers(cfg, a, conn)
     mode = cfg.notify["daily_digest"]
     digest_key = f"digest:{a.today.isoformat()}"
-    if mode == "always":                       # twice a day: 08:00 and 16:00 runs each get one
-        digest_key += ":am" if a.now.astimezone(cfg.tz).hour < 12 else ":pm"
+    digest_key += ":am" if a.now.astimezone(cfg.tz).hour < 12 else ":pm"
     want_digest = (mode == "always" or (mode == "learning" and a.phase == "learning")) and bool(a.cells)
     digest = want_digest and db.notified_get(conn, digest_key) is None
     if not fresh and not digest:
