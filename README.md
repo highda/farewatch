@@ -192,7 +192,7 @@ docker run --rm --user $(id -u):$(id -g) --env-file .env \
 
 - **Notifications (done, 2026-09-30):** the `farewatch` container (`docker-compose.yml`, `farewatch serve`) is triggered by
   n8n (`n8n/farewatch-workflow.json`): `POST http://farewatch:8080/run` returns a ready `notification.nextcloud` payload that
-  n8n forwards to Nextcloud `admin_notifications`. `farewatch/notify.py` decides: a daily digest during the learning phase,
+  n8n forwards to Nextcloud `admin_notifications`. `farewatch/notify.py` decides: a daily digest during the learning phase (`daily_digest = "always"`: one at each of the 08:00 and 16:00 runs),
   afterwards only trips not announced before (again if ≥ `[notify] redrop_pct` cheaper, or newly urgent). Urgent deals lead
   the subject. Sent state lives in the `notified` table. The Nextcloud iOS app ignores the link; the web UI follows it.
 - More sources as plugins (Duffel; airline sale pages), open-jaw (Tokyo in / Osaka out) as extra routes, one-way

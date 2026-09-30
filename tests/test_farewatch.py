@@ -318,6 +318,16 @@ class Notify(unittest.TestCase):
         n = notify.build(c, self._day(conn, c, 2, 13500), conn)                          # 10 % cheaper again
         self.assertEqual(n["new_outliers"], 1)
 
+    def test_digest_always_twice_a_day(self):
+        c = cfg({"notify": {**DEFAULTS["notify"], "daily_digest": "always"}, "general": {**DEFAULTS["general"], "timezone": "UTC"}})
+        conn = db.connect(":memory:")
+        a = self._day(conn, c, 0, None)
+        am = dt.datetime.combine(a.today, dt.time(8, 0), dt.timezone.utc)
+        pm = am.replace(hour=16)
+        self.assertTrue(notify.build(c, stats.analyze(conn, c, am), conn)["digest"])
+        self.assertFalse(notify.build(c, stats.analyze(conn, c, am), conn)["send"])       # same half of the day: silent
+        self.assertTrue(notify.build(c, stats.analyze(conn, c, pm), conn)["digest"])
+
     def test_after_learning_only_deals(self):
         c = cfg({"stats": {**DEFAULTS["stats"], "learning_days": 1}})
         conn = db.connect(":memory:")

@@ -35,7 +35,7 @@ history_days = 60
 max_outliers = 15
 
 [notify]                             # the text farewatch hands to n8n -> Nextcloud (see farewatch/notify.py)
-daily_digest = "learning"            # learning = one status message a day during the learning phase | always | never
+daily_digest = "learning"            # learning = one status message a day during the learning phase | always = one per morning/afternoon run | never
 redrop_pct = 5.0                     # a trip is announced once; again only if it gets this % cheaper (or turns urgent)
 
 # ---- routes: alternative origins are just more routes -------------------------------------------
