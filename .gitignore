@@ -1,0 +1,13 @@
+config.toml
+.env
+data/
+out/
+__pycache__/
+*.pyc
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*
+*.bak*
+.claude/
+n8n/*.local.json

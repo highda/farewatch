@@ -1,0 +1,126 @@
+# farewatch config. Copy to config.toml. Relative paths resolve against this file's folder.
+# Secrets go in env vars (or a .env file next to this file), never in here.
+
+[general]
+currency = "CZK"                     # home currency: everything is shown in it (stored prices are in it too)
+pax = 2                              # travellers; prices are stored per person, totals = pp * pax
+timezone = "Europe/Prague"           # "day" boundaries and displayed times
+data_dir = "data"                    # SQLite lives here (keep OUT of the web root)
+user_agent = "farewatch/0.1 (personal fare watcher; contact: you@example.com)"   # be honest, add a contact
+
+[output]
+dir = "out"                          # on the server e.g. "/var/www/<site>/flights-<random-string>"
+public_url = ""                      # e.g. "https://example.com/flights-<random>/" -> summary.json report_url
+title = "Prague → Tokyo fares"
+keep_archive_days = 30               # dated copies in <dir>/archive/
+noindex = true                       # <meta robots noindex>. The folder is still public if someone guesses the URL
+full_table = "auto"                  # auto = list every trip during the learning phase only | always | never
+
+[trip]
+min_days = 12                        # "around two weeks"
+max_days = 16
+target_days = 14
+max_stops = 1                        # cells with more stops are ignored
+
+[stats]                              # see README.md §6
+learning_days = 14                   # days 1-14: page lists every trip. From day 15: outliers only
+neighbour_days = 5
+min_neighbours = 4
+z_threshold = 2.5                    # robust z-score...
+min_drop_pct = 15.0                  # ...AND at least this % below the baseline = outlier
+urgent_pct = 30.0                    # this far below = "urgent" (error-fare territory)
+fresh_days = 3
+min_history_days = 5
+history_days = 60
+max_outliers = 15
+
+[notify]                             # the text farewatch hands to n8n -> Nextcloud (see farewatch/notify.py)
+daily_digest = "learning"            # learning = one status message a day during the learning phase | always | never
+redrop_pct = 5.0                     # a trip is announced once; again only if it gets this % cheaper (or turns urgent)
+
+# ---- routes: alternative origins are just more routes -------------------------------------------
+[[routes]]
+name = "PRG-TYO"
+origin = "PRG"
+dest = "TYO"                         # city code: Haneda + Narita
+dest_name = "Tokyo"
+
+[[routes]]
+name = "VIE-TYO"
+origin = "VIE"
+dest = "TYO"
+dest_name = "Tokyo"
+penalty_pp = 700                 # ground transfer + hassle, added to the price so it competes fairly
+enabled = false
+
+# ---- departure windows (dates you'd leave). Trip length comes from [trip] ------------------------
+[[windows]]
+name = "autumn"                      # opportunistic: low season, momiji
+depart_from = 2026-10-25
+depart_to = 2026-12-05
+
+[[windows]]
+name = "early-sakura"                # any trip touching February 2027 (checked on the whole trip, not just departure); before "winter" so it wins
+depart_from = 2027-01-16             # = 1 Feb minus max_days: the earliest departure that can still touch February
+depart_to = 2027-02-28
+overlap_from = 2027-02-01
+overlap_to = 2027-02-28
+priority = 2
+headline = true                      # own big price box at the top of the page (priority 1 windows always get one)
+
+[[windows]]
+name = "sakura"                      # Easter is 28 Mar 2027
+depart_from = 2027-03-01
+depart_to = 2027-04-05
+priority = 1                         # 1 = golden window (own headline, sorts first), 2 = preferred, 3 = normal (default)
+min_drop_pct = 8.0                   # optional per-window overrides of [stats]: looser for the windows you want most
+z_threshold = 1.5
+
+[[windows]]
+name = "shoulder-late"
+depart_from = 2027-04-06
+depart_to = 2027-04-24
+
+[[windows]]
+name = "after-golden-week"           # Golden Week is 29 Apr - 5 May: skipped on purpose
+depart_from = 2027-05-08
+depart_to = 2027-06-05
+
+# ---- sources ------------------------------------------------------------------------------------
+[sources.travelpayouts]              # free, official, cached prices. Token: travelpayouts.com -> Profile -> API token
+enabled = true
+token_env = "TRAVELPAYOUTS_TOKEN"
+endpoints = ["latest", "month_matrix"]
+show_to_affiliates = false
+min_delay_s = 2.0
+
+[sources.serpapi]                    # live Google Flights via SerpApi (searches for `pax` seats at once); free plan 250 searches/month
+enabled = false
+api_key_env = "SERPAPI_KEY"
+api_key_backup_env = "SERPAPI_KEY_BACKUP"   # optional second account; used for the rest of the run once the first is exhausted/rejected
+monthly_budget = 90                  # hard cap counted from our own run log
+daily_budget = 7                     # optional: spreads the budget when `run` is scheduled more than once a day
+verify_top_k = 2                     # per run: re-price the K cheapest cached cells...
+recheck_days = 3                     # ...unless already checked in the last N days
+anchors = []                         # fixed cells for a consistent live series, e.g. ["2027-03-25:2027-04-08"]
+# arrival_ids = { TYO = "HND,NRT" }
+
+[sources.mock]                       # SYNTHETIC data; only for `farewatch demo`
+enabled = false
+
+# ---- deal feeds: read rarely, conditional GET, deduped ------------------------------------------
+[[feeds]]
+name = "levneletenkyzprahy.cz"
+url = "https://www.levneletenkyzprahy.cz/rss0k"
+keywords = ["toki", "tokyo", "japon", "osak", "nagoy"]   # stems: Czech declines (Tokio/Tokia/Tokiu)
+min_interval_hours = 12
+
+[[feeds]]
+name = "reddit r/FlightDeals"        # works but rate-limits aggressively (HTTP 429 seen); keep the interval long
+url = "https://www.reddit.com/r/FlightDeals/.rss"
+keywords = ["prague", "prg", "czech", "tokyo", "japan", "europe to asia"]
+min_interval_hours = 24
+enabled = false
+
+# [fx]                               # only needed if a source returns a price in another currency than `currency`
+# EUR = 24.4

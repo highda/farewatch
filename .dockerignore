@@ -1,0 +1,6 @@
+data
+out
+tests
+.env
+config.toml
+README.md

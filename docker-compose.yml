@@ -1,0 +1,25 @@
+# Portainer stack "farewatch". n8n (stack n8nio, npm-network) calls http://farewatch:8080/run on its schedule.
+# Build the image on the host first:  docker build -t farewatch:local <path-to-this-repo>
+# /data/config.toml must use container paths: data_dir = "/data", [output] dir = "/out".
+services:
+  farewatch:
+    image: farewatch:local
+    container_name: farewatch
+    user: "1006:1006"                      # owner of the data dir and the web folder
+    command: ["--config", "/data/config.toml", "serve", "--port", "8080"]
+    environment:
+      - TZ=Europe/Prague
+      - TRAVELPAYOUTS_TOKEN=${TRAVELPAYOUTS_TOKEN}
+      - SERPAPI_KEY=${SERPAPI_KEY}
+      - SERPAPI_KEY_BACKUP=${SERPAPI_KEY_BACKUP:-}   # second account: used when the first is out of searches / rejected
+      - FAREWATCH_RUN_TOKEN=${FAREWATCH_RUN_TOKEN}   # n8n sends it as X-Farewatch-Token
+    volumes:
+      - ${FAREWATCH_DATA_DIR:?set FAREWATCH_DATA_DIR in the stack env}:/data   # host folder with config.toml + the SQLite db
+      - ${FAREWATCH_OUT_DIR:?set FAREWATCH_OUT_DIR in the stack env}:/out   # the (unguessable) public web folder; not in git
+    networks:
+      - npm-network                        # no published ports, no pinned IP; reachable as "farewatch"
+    restart: unless-stopped
+
+networks:
+  npm-network:
+    external: true

@@ -1,0 +1,158 @@
+{
+  "name": "farewatch → Nextcloud",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 8
+            },
+            {
+              "triggerAtHour": 16
+            }
+          ]
+        }
+      },
+      "name": "Daily 08 and 16",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "a1f0c9f2-0001-4c1e-9d10-000000000001"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://farewatch:8080/run",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "name": "farewatch run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "id": "a1f0c9f2-0002-4c1e-9d10-000000000002",
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "",
+          "name": "farewatch run token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// farewatch already decided what to say; this only turns the run result into Nextcloud payloads.\nconst out = [];\nfor (const item of $input.all()) {\n  const r = item.json;\n  if (r.error || r.ok === false) {\n    const why = r.error ? (r.error.message || JSON.stringify(r.error)) : `exit code ${r.exit_code}: no price source succeeded`;\n    out.push({ json: { subject: '⚠️ farewatch run problem', message: String(why).slice(0, 3000) } });\n  }\n  if (r.notification && r.notification.send) out.push({ json: r.notification.nextcloud });\n}\nreturn out;"
+      },
+      "name": "What to send",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        0
+      ],
+      "id": "a1f0c9f2-0003-4c1e-9d10-000000000003"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://nextcloud.example.com/ocs/v2.php/apps/notifications/api/v3/admin_notifications/<nextcloud-user>",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "OCS-APIRequest",
+              "value": "true"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "name": "Nextcloud notify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        0
+      ],
+      "id": "a1f0c9f2-0004-4c1e-9d10-000000000004",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "",
+          "name": "Nextcloud notifications"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "farewatch run": {
+      "main": [
+        [
+          {
+            "node": "What to send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "What to send",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "What to send": {
+      "main": [
+        [
+          {
+            "node": "Nextcloud notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 08 and 16": {
+      "main": [
+        [
+          {
+            "node": "farewatch run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/Prague",
+    "binaryMode": "separate"
+  },
+  "active": false
+}
