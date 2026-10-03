@@ -41,10 +41,12 @@ class SerpApiFailover(unittest.TestCase):
                 if isinstance(r, Exception):
                     raise r
                 return r
-        ctx = SimpleNamespace(cfg=c, http=H(), errors=0, log=lambda m: None)
+        conn = db.connect(":memory:")
+        ctx = SimpleNamespace(cfg=c, http=H(), errors=0, log=lambda m: None, conn=conn, now=NOW, run_id=None)
         ok = {"best_flights": [{"price": 40000, "flights": [{"airline": "X"}], "layovers": []}]}
         responses = {k: (ok if v == "ok" else v) for k, v in responses.items()}
         out = SerpApiSource(c.source("serpapi")).collect(ctx, [(c.routes[0], "2027-03-20", "2027-04-03")] * 2)
+        self.checks = [tuple(r) for r in conn.execute("SELECT status, price_pp_czk FROM checks ORDER BY id")]
         return out, used, ctx.errors, HttpError
 
     def test_switches_to_backup_when_primary_exhausted(self):
@@ -52,11 +54,23 @@ class SerpApiFailover(unittest.TestCase):
         out, used, errs, _ = self._run({"A": HttpError(429, "u"), "B": "ok"}, {"SERPAPI_KEY": "A", "SERPAPI_KEY_BACKUP": "B"})
         self.assertEqual(used, ["A", "B", "B"])         # primary tried once, then the backup for the rest of the run
         self.assertEqual((len(out), errs), (2, 0))
+        self.assertEqual(self.checks, [("ok", 20000.0), ("ok", 20000.0)])   # per person, 2 pax; every answer is a check row
 
     def test_no_backup_counts_errors(self):
         from farewatch.http import HttpError
         with self.assertRaises(SourceError):
             self._run({"A": HttpError(429, "u")}, {"SERPAPI_KEY": "A"})
+
+    def test_no_results_is_a_none_check(self):
+        out, _, errs, _ = self._run({"A": {"error": "Google Flights hasn't returned any results for this query."}}, {"SERPAPI_KEY": "A"})
+        self.assertEqual((out, errs), ([], 0))
+        self.assertEqual(self.checks, [("none", None), ("none", None)])
+
+    def test_gl_hl_currency_pinned(self):
+        from farewatch.sources.serpapi import search_params
+        p = search_params("k", cfg().routes[0], "2027-03-20", "2027-04-03", 2, 1, {}, "czk", "PL")
+        self.assertEqual((p["gl"], p["hl"], p["currency"], p["arrival_id"]), ("pl", "en", "CZK", "HND,NRT"))
+        self.assertEqual(search_params("k", cfg().routes[0], "a", "b", 1, 1, {})["gl"], "cz")
 
 
 class ManualRuns(unittest.TestCase):
@@ -206,6 +220,111 @@ class Stats(unittest.TestCase):
             prices[((start + dt.timedelta(days=i)).isoformat(), (start + dt.timedelta(days=i + 14)).isoformat())] = 20000 + 500 * i
         self._store(conn, prices, dt.date(2026, 10, 1))
         self.assertEqual(stats.analyze(conn, c, NOW).outliers, [])
+
+
+class Availability(unittest.TestCase):
+    """Stale cached prices and live checks: what may be flagged, shown in headline boxes and sent to the phone."""
+    def setUp(self):
+        self.cells = [((dt.date(2027, 3, 18) + dt.timedelta(days=i)).isoformat(),
+                       (dt.date(2027, 3, 18) + dt.timedelta(days=i + 14)).isoformat()) for i in range(19)]
+        self.c = cfg({"sources": {"serpapi": {"enabled": True, "recheck_days": 3, "verify_tolerance_pct": 10,
+                                               "anchors": ["2027-03-20:2027-04-03"], "verify_top_k": 2, "monthly_budget": 100}}})
+        self.conn = db.connect(":memory:")
+        self.deal = self.cells[9]
+
+    def _store(self, cached_at=None, deal=15000):
+        prices = {k: 25000 + 100 * (i % 3) for i, k in enumerate(self.cells)}
+        prices[self.deal] = deal
+        offers = [Offer("travelpayouts", "PRG-TYO", "PRG", "TYO", dep, ret, p, price_pp_czk=p, trip_days=14, stops=1,
+                        cached_at=cached_at) for (dep, ret), p in prices.items()]
+        run = db.start_run(self.conn, "travelpayouts", "discovery", NOW)
+        db.insert_offers(self.conn, run, offers, NOW, NOW.date())
+
+    def _deal(self, a):
+        return next(c for c in a.cells if (c.depart, c.ret) == self.deal)
+
+    def test_unverified_deal_is_flagged_but_not_announced(self):
+        self._store(cached_at="2026-09-30T20:00:00")                 # seen 1.4 days ago: fresh enough
+        a = stats.analyze(self.conn, self.c, NOW)
+        d = self._deal(a)
+        self.assertTrue(d.flags and d.current and not d.confirmed and d.check is None)
+        self.assertEqual(len(a.outliers), 1)
+        self.assertEqual(notify.new_outliers(self.c, a, self.conn), [])            # waits for its live check
+        self.assertEqual([(c.depart, c.ret) for c in notify.candidates(self.c, a, self.conn)], [self.deal])
+        n = notify.build(self.c, a, self.conn)                                    # digest still goes, quoting it as unverified
+        self.assertTrue(n["digest"]); self.assertEqual(n["new_outliers"], 0)
+        self.assertIn("unverified", n["nextcloud"]["message"])
+        self.assertIsNone(db.notified_get(self.conn, f"trip:PRG-TYO:{self.deal[0]}:{self.deal[1]}"))   # not marked: still pending
+
+    def test_stale_price_is_listed_but_never_flagged(self):
+        self._store(cached_at="2026-09-25T10:00:00")                 # seen 6 days ago
+        a = stats.analyze(self.conn, self.c, NOW)
+        d = self._deal(a)
+        self.assertTrue(d.stale and not d.current and not d.flags)
+        self.assertEqual(a.outliers, [])
+        self.assertEqual(notify.candidates(self.c, a, self.conn), [])             # no live search wasted on it
+        self.assertEqual(len(a.cells), 19); self.assertEqual(len(a.current), 0)
+        doc, summary = report.render(self.c, a)
+        self.assertIn("19 stale", doc)
+        self.assertTrue(all(t["stale"] for t in summary["all_trips"]))
+
+    def test_live_check_confirms_then_announces(self):
+        self._store(cached_at="2026-09-30T20:00:00")
+        db.insert_check(self.conn, None, NOW, NOW.date(), "PRG-TYO", *self.deal, "ok", 15400.0)   # +2.7 %: fine
+        a = stats.analyze(self.conn, self.c, NOW)
+        d = self._deal(a)
+        self.assertTrue(d.confirmed and d.check == "ok" and d.check_price == 15400.0)
+        n = notify.build(self.c, a, self.conn)
+        self.assertEqual(n["new_outliers"], 1)
+        self.assertIn("live-checked 15", n["nextcloud"]["message"])
+        self.assertEqual(notify.candidates(self.c, a, self.conn), [])             # nothing left to verify
+
+    def test_live_check_finds_it_gone(self):
+        self._store(cached_at="2026-09-30T20:00:00")
+        db.insert_check(self.conn, None, NOW, NOW.date(), "PRG-TYO", *self.deal, "none")
+        a = stats.analyze(self.conn, self.c, NOW)
+        d = self._deal(a)
+        self.assertTrue(d.dead and not d.flags and not d.confirmed)
+        self.assertEqual(a.outliers, [])
+        self.assertFalse(notify.build(self.c, a, self.conn)["new_outliers"])
+        # headline boxes skip it: the cheapest *current* trip is a 25k one
+        self.assertGreaterEqual(stats.best_of(a.cells).price, 25000)
+        doc, _ = report.render(self.c, a)
+        self.assertIn("no fare found live", doc)
+
+    def test_live_price_well_above_cached_means_gone(self):
+        self._store(cached_at="2026-09-30T20:00:00")
+        db.insert_check(self.conn, None, NOW, NOW.date(), "PRG-TYO", *self.deal, "ok", 19500.0)   # +30 %
+        d = self._deal(stats.analyze(self.conn, self.c, NOW))
+        self.assertTrue(d.dead and d.check == "ok")
+        self.assertIn("gone: live 19", report.status_text(d))
+
+    def test_failed_check_keeps_cell_pending_and_does_not_hide_an_earlier_answer(self):
+        self._store(cached_at="2026-09-30T20:00:00")
+        db.insert_check(self.conn, None, NOW - dt.timedelta(hours=5), NOW.date(), "PRG-TYO", *self.deal, "ok", 15000.0)
+        db.insert_check(self.conn, None, NOW, NOW.date(), "PRG-TYO", *self.deal, "error", None, "HTTP 500")
+        self.assertTrue(self._deal(stats.analyze(self.conn, self.c, NOW)).confirmed)
+        conn2 = db.connect(":memory:"); self.conn = conn2
+        self._store(cached_at="2026-09-30T20:00:00")
+        db.insert_check(conn2, None, NOW, NOW.date(), "PRG-TYO", *self.deal, "error", None, "HTTP 500")
+        d = self._deal(stats.analyze(conn2, self.c, NOW))
+        self.assertTrue(d.check == "error" and d.current and not d.confirmed and not d.dead)
+
+    def test_pick_targets_anchors_once_a_day_then_candidates_within_budget(self):
+        from types import SimpleNamespace
+        from farewatch.verify import pick_targets
+        self._store(cached_at="2026-09-30T20:00:00")
+        scfg = self.c.source("serpapi")
+        ctx = SimpleNamespace(cfg=self.c, conn=self.conn, now=NOW)
+        t = [(r.name, d, r_) for r, d, r_ in pick_targets(ctx, scfg)]
+        self.assertEqual(t, [("PRG-TYO", "2027-03-20", "2027-04-03"), ("PRG-TYO", *self.deal)])   # anchor + the deal
+        db.insert_check(self.conn, None, NOW, NOW.date(), "PRG-TYO", "2027-03-20", "2027-04-03", "ok", 25000.0)
+        db.insert_check(self.conn, None, NOW, NOW.date(), "PRG-TYO", *self.deal, "ok", 15000.0)
+        later = SimpleNamespace(cfg=self.c, conn=self.conn, now=NOW + dt.timedelta(hours=8))                # the 16:00 run
+        self.assertEqual(pick_targets(later, scfg), [])                                                  # anchor done today, deal checked
+        # budget: a manual row eats the month
+        self.conn.execute("INSERT INTO runs(started_at, source, kind, requests, status) VALUES ('2026-10-01T00:00:00Z','serpapi','verify',100,'manual')")
+        self.assertEqual(pick_targets(SimpleNamespace(cfg=self.c, conn=self.conn, now=NOW + dt.timedelta(days=1)), scfg), [])
 
 
 class Phases(unittest.TestCase):

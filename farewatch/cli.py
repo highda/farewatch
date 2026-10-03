@@ -12,7 +12,8 @@ from . import db, notify, pipeline, report, stats
 from .config import Config, load
 from .http import Http, HttpError
 from .sources import serpapi, travelpayouts
-from .sources.base import Context
+from .sources.base import Context, SourceError
+from .verify import remaining_budget
 
 HERE = Path(__file__).resolve().parent.parent
 
@@ -192,7 +193,8 @@ def cmd_probe(args) -> int:
             key = cfg.secret(scfg.get("api_key_env", "SERPAPI_KEY")) or sys.exit("SERPAPI_KEY not set")
             dep, ret = args.dates.split(":")
             payload = http.get_json(serpapi.URL, serpapi.search_params(
-                key, route, dep, ret, cfg.pax, cfg.max_stops, scfg.get("arrival_ids", {}), cfg.currency))
+                key, route, dep, ret, cfg.pax, cfg.max_stops, scfg.get("arrival_ids", {}), cfg.currency,
+                args.gl or str(scfg.get("gl", "cz"))))
             payload.pop("search_parameters", None)
             parsed = serpapi.parse_response(payload, route, dep, ret, cfg.pax, cfg.currency)
             _log(f"parsed {len(parsed)} offer(s): {[(o.price_pp, o.stops, o.airline) for o in parsed]}")
@@ -201,6 +203,59 @@ def cmd_probe(args) -> int:
     text = json.dumps(payload, indent=2, ensure_ascii=False)
     print(text[: args.max_chars] + ("\n... (truncated)" if len(text) > args.max_chars else ""))
     return 0
+
+
+def cmd_gl_check(args) -> int:
+    """Does the point-of-sale country change the price? Prices the anchors once per `gl` and prints a table.
+    Costs len(countries) x len(anchors) live searches, taken from the SerpApi budget (logged as a `manual` run)."""
+    cfg = _load(args)
+    scfg = cfg.source("serpapi")
+    key = cfg.secret(scfg.get("api_key_env", "SERPAPI_KEY")) or sys.exit("SERPAPI_KEY not set")
+    countries = [c.strip().lower() for c in args.countries.split(",") if c.strip()]
+    pairs = [a.split(":") for a in (args.dates or scfg.get("anchors", []))]
+    if not pairs:
+        sys.exit("no anchors in [sources.serpapi] and no --dates given")
+    route = next((r for r in cfg.active_routes if r.name == args.route), None) or cfg.active_routes[0]
+    need = len(countries) * len(pairs)
+    now = dt.datetime.now(dt.timezone.utc)
+    conn = db.connect(cfg.db_path)
+    http = Http(cfg.user_agent)
+    ctx = Context(cfg, conn, http, now, _log)
+    left = remaining_budget(ctx, scfg)
+    if need > left and not args.force:
+        sys.exit(f"needs {need} searches, only {left} left in the budget today/this month (use --force to override)")
+    run_id = db.start_run(conn, "serpapi", "verify", now)
+    prices: dict[str, dict[str, float | None]] = {}
+    errors = 0
+    try:
+        for gl in countries:
+            for dep, ret in pairs:
+                try:
+                    payload = http.get_json(serpapi.URL, serpapi.search_params(
+                        key, route, dep, ret, cfg.pax, cfg.max_stops, scfg.get("arrival_ids", {}), cfg.currency, gl),
+                        min_delay=float(scfg.get("min_delay_s", 3.0)), retry_429=False)
+                    found = serpapi.parse_response(payload, route, dep, ret, cfg.pax, cfg.currency)
+                    prices.setdefault(f"{dep}:{ret}", {})[gl] = found[0].price_pp if found else None
+                except (HttpError, SourceError) as e:
+                    errors += 1
+                    _log(f"gl={gl} {dep}->{ret}: {e}")
+                    prices.setdefault(f"{dep}:{ret}", {})[gl] = None
+    finally:
+        db.finish_run(conn, run_id, dt.datetime.now(dt.timezone.utc), status="manual", requests=http.requests, offers=0,
+                      error=f"gl-check {','.join(countries)}" + (f", {errors} errors" if errors else ""))
+    base = countries[0]
+    print(f"{route.name}, {cfg.pax} pax, per person in {cfg.currency}; % = vs gl={base}")
+    print("trip".ljust(23) + "".join(g.rjust(18) for g in countries))
+    for trip, row in prices.items():
+        ref = row.get(base)
+        cells = []
+        for g in countries:
+            p = row.get(g)
+            pct = f" ({(p - ref) / ref * 100:+.1f}%)" if p is not None and ref and g != base else ""
+            cells.append((f"{p:,.0f}{pct}" if p is not None else "–").rjust(18))
+        print(trip.ljust(23) + "".join(cells))
+    print(f"{http.requests} searches used; {left - http.requests} left in the budget")
+    return 1 if errors else 0
 
 
 def cmd_doctor(args) -> int:
@@ -242,6 +297,13 @@ def cmd_doctor(args) -> int:
         from .plan import departure_months
         n = len(cfg.active_routes) * len(departure_months(cfg)) * len(tp.get("endpoints", ["latest", "month_matrix"]))
         line("ok", f"travelpayouts: ~{n} requests per run")
+    if sp.get("enabled"):
+        anchors, k = len(sp.get("anchors", [])), int(sp.get("verify_top_k", 2))
+        per_day = anchors + 2 * k                       # anchors once a day, up to k candidates per run, 2 runs a day
+        monthly = int(sp.get("monthly_budget", 90))
+        line("ok" if per_day * 31 <= monthly else "WARN",
+             f"serpapi: up to {per_day} searches/day with 2 runs ({anchors} anchors once a day + {k} candidates/run) "
+             f"= {per_day * 31}/month vs monthly_budget {monthly}; gl={sp.get('gl', 'cz')}")
     line("ok", f"feeds: {len(cfg.feeds)} enabled")
     out = cfg.out_dir
     try:
@@ -312,8 +374,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--endpoint", default="latest", choices=["latest", "month_matrix"])
     p.add_argument("--month", default="2027-03")
     p.add_argument("--dates", default="2027-03-25:2027-04-08")
+    p.add_argument("--gl", help="serpapi: point-of-sale country (default: [sources.serpapi] gl, or cz)")
     p.add_argument("--max-chars", type=int, default=4000)
     p.set_defaults(fn=cmd_probe)
+    p = sub.add_parser("gl-check", help="serpapi: price the anchors from several countries (gl) and compare; spends budget")
+    p.add_argument("--countries", default="cz,pl,in,tr", help="comma-separated gl codes; the first is the reference")
+    p.add_argument("--dates", action="append", help="DEP:RET (repeatable); default: the configured anchors")
+    p.add_argument("--route")
+    p.add_argument("--force", action="store_true", help="ignore the daily/monthly budget check")
+    p.set_defaults(fn=cmd_gl_check)
     p = sub.add_parser("demo", help="synthetic data demo (separate DB + output)")
     p.add_argument("--days", type=int, default=14)
     p.add_argument("--dir", default="data/demo")

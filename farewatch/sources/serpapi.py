@@ -8,8 +8,7 @@ price is total / pax; `extra.seats_priced` records it.
 """
 from __future__ import annotations
 
-import datetime as dt
-
+from .. import db
 from ..config import Route
 from ..http import HttpError
 from .base import Context, Offer, SourceError
@@ -21,12 +20,15 @@ DEFAULT_ARRIVALS = {"TYO": "HND,NRT", "OSA": "KIX,ITM"}
 
 
 def search_params(key: str, route: Route, depart: str, ret: str, pax: int, max_stops: int, arrival_ids: dict,
-                  currency: str = "CZK") -> dict:
+                  currency: str = "CZK", gl: str = "cz") -> dict:
+    """`hl`/`gl`/`currency` are always pinned: Google Flights prices shift with the country edition, so an unpinned
+    series would mix geographies. `gl` = the point-of-sale country (`[sources.serpapi] gl`, default cz)."""
     arrivals = {**DEFAULT_ARRIVALS, **arrival_ids}
     return {
         "engine": "google_flights", "api_key": key, "departure_id": route.origin,
         "arrival_id": arrivals.get(route.dest, route.dest), "outbound_date": depart, "return_date": ret,
-        "type": 1, "adults": pax, "currency": currency.upper(), "hl": "en", "stops": STOPS_PARAM.get(max_stops, 0),
+        "type": 1, "adults": pax, "currency": currency.upper(), "hl": "en", "gl": gl.lower(),
+        "stops": STOPS_PARAM.get(max_stops, 0),
     }
 
 
@@ -86,17 +88,25 @@ class SerpApiSource:
         self.scfg = scfg
 
     def collect(self, ctx: Context, targets: list[tuple[Route, str, str]]) -> list[Offer]:
+        """One live search per target. Every answer is also written to `checks`, including "no fare found" and
+        request errors, so a cached cell can later be judged as confirmed / dead / unverified (stats.analyze)."""
         keys = api_keys(ctx.cfg, self.scfg)
         if not keys:
             raise SourceError("missing SerpApi key (env SERPAPI_KEY)")
         k = 0                                        # index of the key in use; moves on when one is exhausted/rejected, for the rest of the run
         offers: list[Offer] = []
+        obs_day = ctx.cfg.local_day(ctx.now)
         for route, depart, ret in targets:
             while True:
-                params = search_params(keys[k], route, depart, ret, ctx.cfg.pax, ctx.cfg.max_stops, self.scfg.get("arrival_ids", {}), ctx.cfg.currency)
+                params = search_params(keys[k], route, depart, ret, ctx.cfg.pax, ctx.cfg.max_stops, self.scfg.get("arrival_ids", {}),
+                                       ctx.cfg.currency, str(self.scfg.get("gl", "cz")))
                 try:
                     payload = ctx.http.get_json(URL, params, min_delay=float(self.scfg.get("min_delay_s", 3.0)), retry_429=False)
-                    offers += parse_response(payload, route, depart, ret, ctx.cfg.pax, ctx.cfg.currency)
+                    found = parse_response(payload, route, depart, ret, ctx.cfg.pax, ctx.cfg.currency)
+                    offers += found
+                    home = ctx.cfg.to_home(found[0].price_pp, found[0].currency) if found else None
+                    db.insert_check(ctx.conn, ctx.run_id, ctx.now, obs_day, route.name, depart, ret,
+                                    "ok" if home is not None else "none", home)
                     break
                 except (HttpError, SourceError) as e:
                     if key_unusable(e) and k + 1 < len(keys):
@@ -105,52 +115,8 @@ class SerpApiSource:
                         continue                     # same cell again with the next key
                     ctx.errors += 1
                     ctx.log(f"serpapi {route.name} {depart}->{ret}: {e}")
+                    db.insert_check(ctx.conn, ctx.run_id, ctx.now, obs_day, route.name, depart, ret, "error", None, str(e))
                     break
         if targets and ctx.errors >= len(targets):
             raise SourceError("every SerpApi request failed")
         return offers
-
-
-def pick_targets(ctx: Context, scfg: dict) -> list[tuple[Route, str, str]]:
-    """Cells to spend live searches on: fixed anchors + cheapest recently-seen cells, within the monthly budget."""
-    from ..db import requests_since, requests_this_month
-
-    today = ctx.cfg.local_day(ctx.now)
-    fresh = (today - dt.timedelta(days=int(ctx.cfg.stats["fresh_days"]))).isoformat()
-    recheck = (today - dt.timedelta(days=int(scfg.get("recheck_days", 3)))).isoformat()
-    remaining = int(scfg.get("monthly_budget", 90)) - requests_this_month(ctx.conn, "serpapi", ctx.now)
-    if scfg.get("daily_budget"):
-        day_start = dt.datetime.combine(today, dt.time(), ctx.cfg.tz)
-        remaining = min(remaining, int(scfg["daily_budget"]) - requests_since(ctx.conn, "serpapi", day_start))
-    if remaining <= 0:
-        return []
-    routes = {r.name: r for r in ctx.cfg.active_routes}
-    targets: list[tuple[Route, str, str]] = []
-    if routes:
-        first = next(iter(routes.values()))
-        for a in scfg.get("anchors", []):            # "2027-03-25:2027-04-08"
-            dep, ret = a.split(":")
-            targets.append((first, dep, ret))
-    rows = ctx.conn.execute(
-        """SELECT route, depart_date, return_date, MIN(price_pp_czk) p FROM offers
-           WHERE source != 'serpapi' AND obs_day >= ? AND depart_date > ?
-           GROUP BY route, depart_date, return_date ORDER BY p LIMIT 200""",
-        (fresh, today.isoformat()),
-    ).fetchall()
-    recent = {
-        (r["route"], r["depart_date"], r["return_date"])
-        for r in ctx.conn.execute(
-            "SELECT route, depart_date, return_date FROM offers WHERE source='serpapi' AND obs_day >= ?", (recheck,))
-    }
-    picked = 0
-    for r in rows:
-        key = (r["route"], r["depart_date"], r["return_date"])
-        if r["route"] in routes and key not in recent and picked < int(scfg.get("verify_top_k", 2)):
-            targets.append((routes[r["route"]], r["depart_date"], r["return_date"]))
-            picked += 1
-    seen, out = set(), []
-    for t in targets:
-        if (t[0].name, t[1], t[2]) not in seen:
-            seen.add((t[0].name, t[1], t[2]))
-            out.append(t)
-    return out[:remaining]

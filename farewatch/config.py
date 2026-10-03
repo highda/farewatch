@@ -28,6 +28,7 @@ DEFAULTS: dict = {
         "urgent_pct": 30.0,       # this far below baseline = "urgent" (error-fare territory)
         "learning_days": 14,      # days since the first run; until then the page shows every trip
         "fresh_days": 3,          # a cell counts as "current" if observed within N days
+        "max_cached_age_days": 2, # ...and a cached price (Travelpayouts `found_at`) older than this is "stale": shown, never flagged or announced
         "min_history_days": 5,    # days of history a cell needs before history-based flags apply
         "history_days": 60,
         "max_outliers": 15,

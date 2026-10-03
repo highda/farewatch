@@ -42,3 +42,4 @@ class Context:
     now: dt.datetime
     log: Callable[[str], None]
     errors: int = 0                        # per-request failures inside the current source
+    run_id: int | None = None              # the `runs` row of the source currently running

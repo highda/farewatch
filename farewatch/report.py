@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import Config
 from .plan import aviasales_url, google_flights_url
-from .stats import Analysis, Cell, median
+from .stats import Analysis, Cell, best_of, median
 
 e = html.escape
 NB = " "
@@ -52,6 +52,33 @@ def age(now: dt.datetime, iso_ts: str | None) -> str:
         t = t.replace(tzinfo=dt.timezone.utc)
     h = (now - t).total_seconds() / 3600
     return f"{h:.0f} h ago" if h < 48 else f"{h / 24:.0f} d ago"
+
+
+def status_text(c: Cell, now: dt.datetime | None = None) -> str:
+    """Availability in words: what a live check said, or why the price can't be trusted yet. Shared with notify."""
+    when = f", {age(now, c.check_at)}" if now and c.check_at else ""
+    if c.live:
+        return "live quote"
+    if c.check == "ok" and not c.dead:
+        return f"live-checked {money(c.check_price)}{when}"
+    if c.check == "ok":
+        return f"gone: live {money(c.check_price)}{when}"
+    if c.check == "none":
+        return f"gone: no fare found live{when}"
+    if c.stale:
+        return "stale"
+    return "unverified"
+
+
+def status_html(c: Cell, now: dt.datetime) -> str:
+    cls = "ok" if c.confirmed else ("bad" if c.dead else "muted")
+    mark = "✓ " if c.confirmed else ("✗ " if c.dead else "")
+    return f"<span class='{cls}'>{mark}{e(status_text(c, now))}</span>"
+
+
+def seen_text(c: Cell, now: dt.datetime) -> str:
+    """When the price was last seen by the source (cached) or quoted (live): the honest age, not our fetch time."""
+    return ("quoted " if c.live else "seen ") + age(now, c.price_seen_at)
 
 
 def nice_ticks(lo: float, hi: float, n: int = 5) -> list[float]:
@@ -203,8 +230,7 @@ def total_note(c: Cell, pax: int) -> str:
 
 
 def golden_best(a: Analysis) -> Cell | None:
-    gold = [c for c in a.cells if c.priority == 1]
-    return min(gold, key=lambda c: c.price) if gold else None
+    return best_of(a.cells, priority=1)
 
 
 def _trip(c: Cell) -> str:
@@ -224,7 +250,7 @@ def _outlier_rows(cfg: Config, a: Analysis, cells: list[Cell]) -> str:
             f"<td class='n'><b>{money(c.price)}</b><br><span class='muted'>{total_note(c, cfg.pax)}</span></td>"
             f"<td class='n'>{money(base)}<br><span class='muted'>−{c.score:.0f} %</span></td>"
             f"<td>{why}<br><span class='muted'>{detail}</span></td>"
-            f"<td>{e(c.source)}<br><span class='muted'>{e(age(a.now, c.obs_at))}</span></td>"
+            f"<td>{e(c.source)}<br><span class='muted'>{e(seen_text(c, a.now))}</span><br>{status_html(c, a.now)}</td>"
             f"<td>{_cell_links(cfg, c)}</td></tr>")
     return "".join(rows)
 
@@ -248,9 +274,9 @@ def render(cfg: Config, a: Analysis) -> tuple[str, dict]:
     set_currency(cfg.currency)
     st, pax = cfg.stats, cfg.pax
     local_now = a.now.astimezone(cfg.tz)
-    primary = [c for c in a.cells]
-    best = min(primary, key=lambda c: c.price) if primary else None
+    best = best_of(a.cells)
     max_days_data = a.collection_days
+    stale, dead = sum(c.stale for c in a.cells), sum(c.dead for c in a.cells)
     parts: list[str] = []
 
     if "mock" in a.sources_seen:
@@ -265,26 +291,31 @@ def render(cfg: Config, a: Analysis) -> tuple[str, dict]:
             f'(≥{st["min_drop_pct"]:.0f} % and {st["z_threshold"]:.1f}σ below the baseline). Comparisons with each trip’s own history '
             f'start once it has {st["min_history_days"]} days of data.</div>')
         parts.append(_calibration_card(a, st))
+    if stale or dead:
+        parts.append(
+            f'<div class="banner">Availability: <b>{stale} stale</b> cached price(s) (seen by the source more than '
+            f'{st["max_cached_age_days"]:g} days ago) and <b>{dead} gone</b> (a live check found no such fare) are listed greyed '
+            f'out for the record, but are never flagged, used in headline boxes, or sent to the phone. Only ✓ live-checked prices are announced.</div>')
 
     gold = golden_best(a)
     boxes: list[tuple[Cell | None, str]] = []
     for w in cfg.windows:                                   # one box per headline window, in config order
         if w.headline:
-            cs = [c for c in a.cells if c.window == w.name]
-            boxes.append((min(cs, key=lambda c: c.price) if cs else None, f"Best {w.name} (for {pax})"))
+            boxes.append((best_of(a.cells, window=w.name), f"Best {w.name} (for {pax})"))
     if best and all(best is not c for c, _ in boxes):
         boxes.append((best, f"Cheapest trip overall (for {pax})"))
     hero_html = []
     for c, label in boxes:
         if c is None:
             hero_html.append(f'<div class="card hero"><div class="lbl">{e(label)}</div><div class="big muted">–</div>'
-                             f'<div class="side">no fares seen yet</div></div>')
+                             f'<div class="side">no current fares</div></div>')
             continue
         hero_html.append(
             f'<div class="card hero"><div class="lbl">{e(label)}</div>'
             f'<div class="big">{money(c.price * pax)}</div>'
             f'<div class="side">{money(c.price)} per person<br>'
-            f'{_trip(c)} · {e(c.route)}<br><span class="muted">{e(c.window)} · {e(c.source)}, {e(age(a.now, c.obs_at))}<br>{_cell_links(cfg, c)}</span></div></div>')
+            f'{_trip(c)} · {e(c.route)}<br><span class="muted">{e(c.window)} · {e(c.source)}, {e(seen_text(c, a.now))}</span><br>'
+            f'{status_html(c, a.now)}<br><span class="muted">{_cell_links(cfg, c)}</span></div></div>')
     if hero_html:
         parts.append('<div class="heroes">' + "".join(hero_html) + "</div>")
 
@@ -292,7 +323,7 @@ def render(cfg: Config, a: Analysis) -> tuple[str, dict]:
     parts.append("<h2>Cheap outliers" + (" <span class=\"muted\" style=\"font-weight:400\">(provisional)</span>" if a.phase == "learning" else "") + "</h2>")
     if outs:
         parts.append('<div class="card scroll"><table><thead><tr><th>Trip</th><th class="n">Price (pp)</th><th class="n">Baseline</th>'
-                     '<th>Why</th><th>Source</th><th>Check</th></tr></thead><tbody>'
+                     '<th>Why</th><th>Source · availability</th><th>Check</th></tr></thead><tbody>'
                      + _outlier_rows(cfg, a, outs) + "</tbody></table></div>")
     else:
         parts.append('<div class="card muted">Nothing unusual right now: no trip is ≥'
@@ -358,13 +389,14 @@ def render(cfg: Config, a: Analysis) -> tuple[str, dict]:
         order = {w.name: i for i, w in enumerate(cfg.windows)}
         allc = sorted(a.cells, key=lambda c: (c.source, c.route, order.get(c.window, 99), c.depart, c.ret))
         rows = "".join(
-            f"<tr><td>{_trip(c)}</td><td>{e(c.window)}</td><td class='n'>{money(c.price)}</td><td class='n'>{money(c.price * pax)}</td>"
+            f"<tr{'' if c.current else ' class=muted'}><td>{_trip(c)}</td><td>{e(c.window)}</td><td class='n'>{money(c.price)}</td><td class='n'>{money(c.price * pax)}</td>"
             f"<td class='n'>{money(c.base)}</td><td class='n'>{vs_baseline(c)}</td>"
-            f"<td>{e(c.source)}</td><td>{'' if c.stops is None else c.stops}</td>"
-            f"<td>{e(', '.join(c.flags))}</td></tr>" for c in allc)
-        parts.append(f'<h2>All trips</h2><details class="card" open><summary>{len(allc)} trips, by window and departure date</summary>'
+            f"<td>{e(c.source)}<br><span class='muted'>{e(seen_text(c, a.now))}</span></td><td>{status_html(c, a.now)}</td>"
+            f"<td>{'' if c.stops is None else c.stops}</td><td>{e(', '.join(c.flags))}</td></tr>" for c in allc)
+        parts.append(f'<h2>All trips</h2><details class="card" open><summary>{len(allc)} trips, by window and departure date'
+                     f' ({len(allc) - stale - dead} current, {stale} stale, {dead} gone)</summary>'
                      f'<div class="scroll"><table><thead><tr><th>Trip</th><th>Window</th><th class="n">Per person</th><th class="n">For {pax}</th>'
-                     f'<th class="n">Neighbour median</th><th class="n">vs. it</th><th>Source</th><th>Stops</th><th>Flags</th></tr></thead>'
+                     f'<th class="n">Neighbour median</th><th class="n">vs. it</th><th>Source</th><th>Availability</th><th>Stops</th><th>Flags</th></tr></thead>'
                      f'<tbody>{rows}</tbody></table></div></details>')
     runs = "".join(
         f"<tr><td>{e(r['started_at'][:16].replace('T', ' '))}</td><td>{e(r['source'])}</td>"
@@ -381,12 +413,14 @@ def render(cfg: Config, a: Analysis) -> tuple[str, dict]:
     doc = (f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
            f'{robots}<title>{e(cfg.output["title"])}</title><style>{CSS}</style></head><body><main>'
            f'<h1>{e(cfg.output["title"])}</h1><p class="sub">{pax} travellers · {cfg.min_days}–{cfg.max_days}-day trips · '
-           f'updated {local_now:%a %d %b %Y, %H:%M} ({e(str(cfg.tz))}) · {len(a.cells)} trips tracked, {max_days_data} collection days</p>'
+           f'updated {local_now:%a %d %b %Y, %H:%M} ({e(str(cfg.tz))}) · {len(a.current)} current trips'
+           + (f' ({stale} stale, {dead} gone)' if stale or dead else '') + f', {max_days_data} collection days</p>'
            + "".join(parts) + "</main></body></html>")
 
     summary = {
         "generated_at": a.now.astimezone(dt.timezone.utc).isoformat(),
         "currency": cfg.currency, "pax": pax, "collection_days": max_days_data, "trips_tracked": len(a.cells),
+        "trips_current": len(a.current), "trips_stale": stale, "trips_gone": dead,
         "synthetic": "mock" in a.sources_seen,
         "phase": a.phase, "learning_days": int(st["learning_days"]), "calibration": a.calibration,
         "thresholds": {"z": st["z_threshold"], "min_drop_pct": st["min_drop_pct"], "urgent_pct": st["urgent_pct"]},
@@ -408,7 +442,9 @@ def _cell_json(cfg: Config, c: Cell) -> dict:
     return {"route": c.route, "depart": c.depart, "return": c.ret, "days": c.days, "window": c.window,
             "price_pp": round(c.price), "price_total": round(c.price * cfg.pax), "seats_quoted": seats_quoted(c),
             "priority": c.priority, "source": c.source, "stops": c.stops,
-            "airline": c.airline, "flags": c.flags, "urgent": c.urgent, "below_baseline_pct": round(c.score, 1)}
+            "airline": c.airline, "flags": c.flags, "urgent": c.urgent, "below_baseline_pct": round(c.score, 1),
+            "price_seen_at": c.price_seen_at, "stale": c.stale, "gone": c.dead, "confirmed": c.confirmed,
+            "live_check": c.check, "live_price_pp": round(c.check_price) if c.check_price is not None else None}
 
 
 def _atomic_write(path: Path, text: str) -> None:

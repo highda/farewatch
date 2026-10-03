@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS deals(
 CREATE TABLE IF NOT EXISTS notified(          -- what the phone was already told (notify.py)
   key TEXT PRIMARY KEY, price_pp REAL, urgent INTEGER DEFAULT 0, at TEXT
 );
+CREATE TABLE IF NOT EXISTS checks(            -- live checks of cached cells (serpapi): one row per request, incl. "nothing found"
+  id INTEGER PRIMARY KEY, run_id INTEGER REFERENCES runs(id), checked_at TEXT NOT NULL, obs_day TEXT NOT NULL,
+  route TEXT NOT NULL, depart_date TEXT NOT NULL, return_date TEXT NOT NULL,
+  status TEXT NOT NULL,                        -- ok (price_pp_czk set) | none (Google found no fare) | error (request failed)
+  price_pp_czk REAL, reason TEXT
+);
+CREATE INDEX IF NOT EXISTS checks_cell ON checks(route, depart_date, return_date, obs_day);
 CREATE TABLE IF NOT EXISTS http_cache(
   url TEXT PRIMARY KEY, etag TEXT, last_modified TEXT, fetched_at TEXT
 );
@@ -83,6 +90,26 @@ def insert_offers(conn, run_id: int, offers: list[Offer], now: dt.datetime, obs_
     )
     conn.commit()
     return len(rows)
+
+
+def insert_check(conn, run_id: int | None, now: dt.datetime, obs_day: dt.date, route: str, depart: str, ret: str,
+                 status: str, price_pp_czk: float | None = None, reason: str | None = None) -> None:
+    conn.execute(
+        """INSERT INTO checks(run_id, checked_at, obs_day, route, depart_date, return_date, status, price_pp_czk, reason)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (run_id, iso(now), obs_day.isoformat(), route, depart, ret, status, price_pp_czk, (reason or "")[:200] or None),
+    )
+    conn.commit()
+
+
+def latest_checks(conn, since_day: str) -> dict[tuple[str, str, str], "sqlite3.Row"]:
+    """Newest check per (route, depart, return) since `since_day`; a failed request never hides an earlier real answer."""
+    out: dict[tuple[str, str, str], sqlite3.Row] = {}
+    for r in conn.execute("SELECT * FROM checks WHERE obs_day >= ? ORDER BY checked_at", (since_day,)):
+        key = (r["route"], r["depart_date"], r["return_date"])
+        if r["status"] != "error" or key not in out:
+            out[key] = r
+    return out
 
 
 def requests_this_month(conn, source: str, now: dt.datetime) -> int:

@@ -18,8 +18,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+from . import db
 from .config import Config
 from .plan import window_for
+
+LIVE_SOURCES = {"serpapi"}                 # sources whose price is a live quote, not a cached sighting
 
 
 def median(xs):
@@ -65,6 +68,14 @@ class Cell:
     h_pct: float | None = None
     h_min: float | None = None
     flags: list[str] = field(default_factory=list)
+    # availability (set in analyze): is this price still something you could book?
+    cached_at: str | None = None      # when the source itself last saw the price (cached sources); None = live quote
+    live: bool = False                # the source is a live quote (serpapi): nothing to verify
+    stale: bool = False               # cached price older than max_cached_age_days: shown, never flagged or announced
+    check: str | None = None          # last live check within recheck_days: ok | none | error | None = not checked
+    check_price: float | None = None  # live price pp incl. route penalty, when check == ok
+    check_at: str | None = None
+    dead: bool = False                # live check found nothing, or a price well above the cached one
 
     @property
     def score(self) -> float:
@@ -73,6 +84,20 @@ class Cell:
     @property
     def urgent(self) -> bool:
         return "urgent" in self.flags
+
+    @property
+    def confirmed(self) -> bool:
+        """Safe to put on the phone: a live quote, or a cached price a live check agreed with."""
+        return self.live or (self.check == "ok" and not self.dead)
+
+    @property
+    def current(self) -> bool:
+        return not self.stale and not self.dead
+
+    @property
+    def price_seen_at(self) -> str | None:
+        """When the price was last seen by whoever quoted it (not when we fetched it)."""
+        return self.cached_at or self.obs_at
 
 
 @dataclass
@@ -106,6 +131,26 @@ class Analysis:
     @property
     def outliers(self) -> list[Cell]:
         return sorted((c for c in self.cells if c.flags), key=lambda c: (c.priority, -c.score, c.price))
+
+    @property
+    def current(self) -> list[Cell]:
+        """Cells whose price is still plausibly bookable (not stale, not found dead by a live check)."""
+        return [c for c in self.cells if c.current]
+
+
+def best_of(cells: list[Cell], priority: int | None = None, window: str | None = None) -> Cell | None:
+    """Cheapest current cell (confirmed ones first), optionally within a window priority or a named window."""
+    pool = [c for c in cells if c.current and (priority is None or c.priority == priority) and (window is None or c.window == window)]
+    return min(pool, key=lambda c: (not c.confirmed, c.price)) if pool else None
+
+
+def _age_days(now: dt.datetime, ts: str | None) -> float | None:
+    if not ts:
+        return None
+    t = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return (now - t).total_seconds() / 86400
 
 
 def score_neighbours(group, st: dict) -> None:
@@ -181,20 +226,44 @@ def analyze(conn, cfg: Config, now: dt.datetime) -> Analysis:
             days=r["trip_days"], window=w.name, price=r["price_pp_czk"] + pen, raw_price=r["price_pp_czk"],
             stops=r["stops"], airline=r["airline"], duration_min=r["duration_min"], obs_at=r["fetched_at"],
             extra=json.loads(r["extra"]) if r["extra"] else None, priority=w.priority,
+            cached_at=r["cached_at"], live=r["source"] in LIVE_SOURCES,
         ))
+
+    # availability: stale cached prices, and what the live checks said about cached cells
+    sp = cfg.source("serpapi")
+    checks = db.latest_checks(conn, (today - dt.timedelta(days=int(sp.get("recheck_days", 3)))).isoformat())
+    tolerance = 1 + float(sp.get("verify_tolerance_pct", 10)) / 100
+    max_age = float(st["max_cached_age_days"])
+    for c in cells:
+        if c.live:
+            continue
+        age = _age_days(now, c.cached_at)
+        c.stale = age is not None and age > max_age
+        chk = checks.get((c.route, c.depart, c.ret))
+        if chk is None:
+            continue
+        c.check, c.check_at = chk["status"], chk["checked_at"]
+        if chk["status"] == "ok":
+            c.check_price = chk["price_pp_czk"] + penalty.get(c.route, 0.0)
+            c.dead = c.check_price > c.price * tolerance      # the cached fare is gone; the live price is its own serpapi cell
+        elif chk["status"] == "none":
+            c.dead = True
 
     by_group: dict[tuple, list[Cell]] = defaultdict(list)
     for c in cells:
         by_group[(c.source, c.route)].append(c)
 
+    # stale/dead cells still serve as neighbours (the price level is real), but are never flagged themselves
     for group in by_group.values():
         score_neighbours(group, st)
         for c in group:
             z_thr, drop = cfg.thresholds(c.window)
-            if c.z is not None and c.z <= -z_thr and c.pct >= drop:
+            if c.current and c.z is not None and c.z <= -z_thr and c.pct >= drop:
                 c.flags.append("below neighbours")
 
     for c in cells:
+        if not c.current:
+            continue
         past = [p for day, p in daily[(c.source, c.route, c.depart, c.ret)].items() if day < today.isoformat()]
         c.h_n = len(past)
         z_thr, drop = cfg.thresholds(c.window)

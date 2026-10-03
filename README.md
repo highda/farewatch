@@ -62,7 +62,7 @@ The RSS path was tested against the live Czech feed.
 
 ```
 scheduler (n8n / cron)            ┌── sources/travelpayouts   (discovery: cached cells)
-   │  farewatch run               ├── sources/serpapi         (verify: live check of cheapest cells + anchors)
+   │  farewatch run               ├── sources/serpapi         (verify: live check of what the phone would get + anchors; verify.py picks)
    ▼                              ├── sources/feeds           (RSS deals, keyword filter, dedupe)
 pipeline.collect ─────────────────┘
    │ normalise: home currency, drop out-of-scope cells / too many stops, cheapest offer per cell per source
@@ -87,7 +87,7 @@ report.write   → <output.dir>/index.html  (+ summary.json, archive/YYYY-MM-DD.
 | Thing | Volume |
 |---|---|
 | Travelpayouts | routes × departure months (7 with the example windows) × 2 endpoints ≈ **14 requests/run**, 2 s apart |
-| SerpApi | `verify_top_k` (2) per run + anchors; hard cap `monthly_budget` (90). With 2 runs/day it would run dry in ~3 weeks. Either run it once a day (`collect --source serpapi`) or lower `verify_top_k` |
+| SerpApi | anchors **once a day** + up to `verify_top_k` *candidates* per run (cached cells the next notification would mention and that have no live check within `recheck_days`); caps `daily_budget` / `monthly_budget` (both keys together). Example config: 4 anchors + 2 × 4 = at most 12/day ≈ 372/month of the 460 cap. `doctor` prints this arithmetic |
 | Feeds | one conditional GET per feed, at most every `min_interval_hours` (12 / 24) |
 
 ## 5. Scheduling (outside the code)
@@ -130,6 +130,26 @@ observation and at least half of `min_drop_pct` under the historical median), **
 Expected weak spots: hundreds of correlated cells means the odd false positive is normal (raise `min_drop_pct` if noisy); cached
 sources can jump when a sample appears or disappears; cells expire as dates pass, so a trend line mixes slightly different cell
 sets.
+
+**Availability (is the price still bookable?).** A cached price is a sighting, not a quote: Travelpayouts reports *when* it saw it
+(`found_at`, stored as `cached_at`), and that is the age the page shows (“seen 5 d ago”), not our fetch time. Three states per
+cached cell, decided in `stats.analyze`:
+- **stale** – `cached_at` older than `max_cached_age_days` (2). Listed greyed out, counted in the neighbour baseline (the price
+  level is real), but never flagged, never in a headline box, never on the phone.
+- **gone** – the last live check within `recheck_days` found no fare, or a price more than `verify_tolerance_pct` (10 %) above the
+  cached one. Same treatment as stale; the live price is its own `serpapi` cell.
+- **confirmed** – a live check agreed (✓ on the page, “live-checked 17 481 Kč” in the message). `serpapi` cells are live quotes and
+  always confirmed.
+
+Everything else is *unverified*: flagged on the page, but **not announced and not marked** – `verify.pick_targets` searches exactly
+these cells next (new outliers first, then the golden-window best and the cheapest overall), so a real deal goes out one run later,
+verified. Every live answer, including “nothing found” and request errors, lands in the `checks` table. With SerpApi disabled there is
+nothing to check against and cached outliers are announced as before, labelled “unverified”.
+
+**Point of sale.** `hl`, `gl` and `currency` are pinned on every SerpApi request (`[sources.serpapi] gl`, default `cz`), otherwise
+the live series would mix country editions. `farewatch gl-check --countries cz,pl,in,tr` prices the anchors from several
+countries and prints the differences (costs countries × anchors searches, logged as a `manual` run). Measured on 3 Oct 2026 for
+PRG–TYO, 2 pax: cz = pl = in = tr within 0–1.5 %, so there is nothing to gain from a foreign point of sale here.
 
 Rough sanity numbers (my guesses, not measured): Prague–Tokyo return economy ~16–25 k CZK per person off-peak, 25–40 k around
 sakura/Easter. The tool sets its own baseline; these only help judge whether the data looks plausible.
@@ -227,7 +247,7 @@ useful for seeing the report before any real data exists.
 - **Headline boxes:** each window with `headline = true` (priority-1 windows implicitly) gets a big price box at the top of the page, plus
   "cheapest overall".
 - **Scheduling:** n8n workflow `n8n/farewatch-workflow.json` runs at 08:00 and 16:00 (Europe/Prague). `daily_budget` is a shared cap across
-  both runs (12 needed: 2 x (anchors + `verify_top_k`)), the rest is headroom for manual runs.
+  both runs (at most anchors + 2 × `verify_top_k` = 12 with the example config), the rest is headroom for manual runs.
 - **Seeding used API quota:** to tell the budget counter about searches made elsewhere, insert a row into `runs` with
   `source='serpapi'`, `kind='verify'`, `requests=N`, `status='manual'`, `started_at` = any time this month before today. `manual` rows count
   toward `monthly_budget` but are ignored when the learning phase is dated.

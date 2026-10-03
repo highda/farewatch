@@ -10,7 +10,7 @@ from .config import Config
 from .http import Http
 from .sources import DISCOVERY, VERIFY, feeds
 from .sources.base import Context, Offer, SourceError
-from .sources.serpapi import pick_targets
+from .verify import pick_targets
 
 
 def _stderr(msg: str) -> None:
@@ -50,7 +50,7 @@ def collect(cfg: Config, conn, now: dt.datetime | None = None, only: set[str] | 
 
     def run_source(name: str, kind: str, fn: Callable[[], list[Offer]]) -> None:
         run_id = db.start_run(conn, name, kind, now)
-        ctx.errors, before = 0, http.requests
+        ctx.errors, ctx.run_id, before = 0, run_id, http.requests
         try:
             offers = normalise(cfg, fn(), log)
             n = db.insert_offers(conn, run_id, offers, now, obs_day)

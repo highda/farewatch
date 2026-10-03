@@ -30,6 +30,7 @@ z_threshold = 2.5                    # robust z-score...
 min_drop_pct = 15.0                  # ...AND at least this % below the baseline = outlier
 urgent_pct = 30.0                    # this far below = "urgent" (error-fare territory)
 fresh_days = 3
+max_cached_age_days = 2              # a cached price (Travelpayouts found_at) older than this is "stale": listed, never flagged/announced
 min_history_days = 5
 history_days = 60
 max_outliers = 15
@@ -100,8 +101,10 @@ api_key_env = "SERPAPI_KEY"
 api_key_backup_env = "SERPAPI_KEY_BACKUP"   # optional second account; used for the rest of the run once the first is exhausted/rejected
 monthly_budget = 90                  # hard cap counted from our own run log
 daily_budget = 7                     # optional: spreads the budget when `run` is scheduled more than once a day
-verify_top_k = 2                     # per run: re-price the K cheapest cached cells...
-recheck_days = 3                     # ...unless already checked in the last N days
+verify_top_k = 2                     # per run: live-check up to K cached cells the next notification would mention (new outliers, golden best, cheapest)...
+recheck_days = 3                     # ...unless already checked in the last N days. A cached deal is announced only after a live check agrees
+verify_tolerance_pct = 10            # live price more than this % above the cached one = the cached fare is gone
+gl = "cz"                            # Google Flights point-of-sale country; hl/gl/currency are always pinned (see `gl-check`)
 anchors = []                         # fixed cells for a consistent live series, e.g. ["2027-03-25:2027-04-08"]
 # arrival_ids = { TYO = "HND,NRT" }
 
